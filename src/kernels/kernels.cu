@@ -11,6 +11,31 @@ namespace cg = cooperative_groups;
 
 namespace turbo_ocr::kernels {
 
+// Cache occupancy + SM count per (device, kernel, block_size). Uses
+// cudaGetDevice() so multi-GPU hosts don't get sized for device 0.
+template <typename Fn>
+static int coop_grid_for(Fn kernel, int threads) {
+  int dev = 0;
+  cudaGetDevice(&dev);
+  static thread_local int cached_dev = -1;
+  static thread_local int cached_sms = 0;
+  static thread_local const void *cached_fn = nullptr;
+  static thread_local int cached_threads = 0;
+  static thread_local int cached_per_sm = 0;
+  if (dev != cached_dev) {
+    cudaDeviceGetAttribute(&cached_sms, cudaDevAttrMultiProcessorCount, dev);
+    cached_dev = dev;
+    cached_fn = nullptr;
+  }
+  if (cached_fn != (const void *)kernel || cached_threads != threads) {
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &cached_per_sm, kernel, threads, 0);
+    cached_fn = (const void *)kernel;
+    cached_threads = threads;
+  }
+  return cached_per_sm * cached_sms;
+}
+
 // --- Fused Resize + Normalize + CHW for Detection ---
 
 __global__ __launch_bounds__(256)
@@ -547,9 +572,10 @@ void ccl_tile_local_kernel(const uint8_t * __restrict__ bitmap,
       int r = lid;
       while (s_labels[r] >= 0 && s_labels[r] != r) r = s_labels[r];
 
-      // Union with right neighbor
-      if (lx + 1 < kTileW) {
-        int nid = ly * kTileW + (lx + 1);
+      // 8-connectivity: union with R, B, BR, BL forward neighbors
+      // (matches OpenCV findContours which uses 8-conn — without this, italic
+      // strokes and diagonal text fragments split into separate components)
+      auto try_union = [&](int nid) {
         if (s_labels[nid] >= 0) {
           int nr = nid;
           while (s_labels[nr] >= 0 && s_labels[nr] != nr) nr = s_labels[nr];
@@ -558,19 +584,13 @@ void ccl_tile_local_kernel(const uint8_t * __restrict__ bitmap,
             atomicMin(&s_labels[mx], mn);
           }
         }
-      }
-      // Union with bottom neighbor
-      if (ly + 1 < kTileH) {
-        int nid = (ly + 1) * kTileW + lx;
-        if (s_labels[nid] >= 0) {
-          int nr = nid;
-          while (s_labels[nr] >= 0 && s_labels[nr] != nr) nr = s_labels[nr];
-          if (r != nr) {
-            int mn = min(r, nr), mx = max(r, nr);
-            atomicMin(&s_labels[mx], mn);
-          }
-        }
-      }
+      };
+      if (lx + 1 < kTileW) try_union(ly * kTileW + (lx + 1));
+      if (ly + 1 < kTileH) try_union((ly + 1) * kTileW + lx);
+      if (lx + 1 < kTileW && ly + 1 < kTileH)
+        try_union((ly + 1) * kTileW + (lx + 1));
+      if (lx - 1 >= 0 && ly + 1 < kTileH)
+        try_union((ly + 1) * kTileW + (lx - 1));
     }
     __syncthreads();
   }
@@ -620,11 +640,20 @@ void ccl_boundary_merge_kernel(const uint8_t * __restrict__ bitmap,
 
   bool on_right = ((x % kTileW) == kTileW - 1) && (x + 1 < w);
   bool on_bottom = ((y % kTileH) == kTileH - 1) && (y + 1 < h);
+  bool on_left = ((x % kTileW) == 0) && (x > 0);
 
+  // 4-conn cross-tile (R, B)
   if (on_right && bitmap[idx + 1] != 0)
     ccl_union(labels, idx, idx + 1);
   if (on_bottom && bitmap[idx + w] != 0)
     ccl_union(labels, idx, idx + w);
+  // 8-conn cross-tile diagonals (BR, BL)
+  if ((on_right || on_bottom) && (x + 1 < w) && (y + 1 < h) &&
+      bitmap[idx + w + 1] != 0)
+    ccl_union(labels, idx, idx + w + 1);
+  if ((on_left || on_bottom) && (x > 0) && (y + 1 < h) &&
+      bitmap[idx + w - 1] != 0)
+    ccl_union(labels, idx, idx + w - 1);
 }
 
 // Step 3: Flatten (path compression)
@@ -841,7 +870,8 @@ int cuda_gpu_ccl_detect(
     int *d_num_boxes,
     GpuDetBox *h_boxes,
     int *h_num_boxes,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int *h_num_total) {
 
   int total = w * h;
   int threads = 256;
@@ -856,8 +886,12 @@ int cuda_gpu_ccl_detect(
     CUDA_CHECK(cudaGetLastError());
   }
 
-  // Step 2: Merge across tile boundaries (2 iterations for convergence)
-  for (int i = 0; i < 2; i++) {
+  // Step 2: Merge across tile boundaries.
+  // 8 iterations: long thin text lines span many tile boundaries; 2 passes
+  // can leave splits that drop F1 in downstream JFA. 8 passes converge for
+  // typical document text. Cost is small — each pass touches only fg pixels
+  // on tile borders.
+  for (int i = 0; i < 8; i++) {
     ccl_boundary_merge_kernel<<<blocks, threads, 0, stream>>>(
         d_bitmap, d_labels, w, h);
   }
@@ -874,13 +908,7 @@ int cuda_gpu_ccl_detect(
   // use a stride loop in the kernel to cover all pixels.
   CUDA_CHECK(cudaMemsetAsync(d_id_counter, 0, sizeof(int), stream));
   {
-    int coop_blocks_per_sm = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &coop_blocks_per_sm, ccl_fused_compact_ids_kernel, threads, 0));
-    int num_sms = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0));
-    int coop_grid = coop_blocks_per_sm * num_sms;
-    // Don't launch more blocks than needed
+    int coop_grid = coop_grid_for(ccl_fused_compact_ids_kernel, threads);
     if (coop_grid > blocks) coop_grid = blocks;
 
     int max_comp = kMaxGpuComponents;
@@ -917,11 +945,14 @@ int cuda_gpu_ccl_detect(
   }
 
   // === SINGLE SYNC: copy count + boxes in one batch, one sync ===
-  // Copy count first, then max possible boxes. One sync for both.
   CUDA_CHECK(cudaMemcpyAsync(h_num_boxes, d_num_boxes, sizeof(int),
                               cudaMemcpyDeviceToHost, stream));
-  // Speculatively copy up to kMaxGpuComponents boxes (small: 48KB max).
-  // After sync we'll use only h_count of them.
+  // Optional: pre-filter component total for callers that index by pre-filter
+  // compact_id (e.g. the JFA per-component expand path).
+  if (h_num_total != nullptr) {
+    CUDA_CHECK(cudaMemcpyAsync(h_num_total, d_id_counter, sizeof(int),
+                                cudaMemcpyDeviceToHost, stream));
+  }
   CUDA_CHECK(cudaMemcpyAsync(h_boxes, d_out_bboxes,
                               kMaxGpuComponents * sizeof(GpuDetBox),
                               cudaMemcpyDeviceToHost, stream));
