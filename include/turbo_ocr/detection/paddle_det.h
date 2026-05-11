@@ -44,8 +44,13 @@ private:
   static constexpr float kMinBoxSide = 3.0f;
   static constexpr float kMinUnclippedSide = 5.0f; // kMinBoxSide + 2
 
-  // GPU CCL mode: 0=CPU contours, 1=GPU CCL+per-ROI findContours (default, same accuracy + faster),
-  // 2=GPU CCL fast (experimental, speed-only — poor accuracy F1~53%, not recommended for production)
+  // GPU CCL mode:
+  //   0 = CPU contours fallback (OpenCV findContours)
+  //   1 = GPU CCL + per-ROI findContours on CPU (default; produces rotated
+  //       min-area-rects; F1 matches CPU baseline)
+  //   2 = all-GPU JFA per-component Euclidean unclip (no pred_map download,
+  //       no CPU contours; F1 within run-to-run noise of CCL=1; axis-aligned
+  //       quads only)
   int gpu_ccl_mode_ = 1;
   float box_thresh_ = kDetDbBoxThresh;
   float unclip_scale_ = 1.0f;
@@ -115,6 +120,9 @@ private:
   CudaPtr<int2> d_jfa_seeds_;          // [max_pixels] JFA nearest-seed coords (primary)
   CudaPtr<int2> d_jfa_seeds_alt_;      // [max_pixels] JFA ping-pong buffer
   CudaPtr<float> d_expand_per_comp_;   // [kMaxGpuComponents] per-component expand
+  // Pinned host buffer for post-expand bboxes. Pre-allocated once so
+  // run_gpu_ccl_fast doesn't cudaMallocHost on every request.
+  CudaHostPtr<kernels::GpuDetBox> h_exp_boxes_;
 
   // Common buffer allocation (called by both load_model overloads)
   [[nodiscard]] bool init_buffers();

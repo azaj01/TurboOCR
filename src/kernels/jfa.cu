@@ -186,8 +186,6 @@ void cuda_compute_expand_per_comp(
 }
 
 void cuda_jfa_extract_bboxes(const uint32_t *d_expanded_labels,
-                             const float * /*d_pred_map*/,
-                             const float * /*d_expand_per_comp*/,
                              int w, int h,
                              GpuDetBox *d_bboxes, int num_slots,
                              cudaStream_t stream) {

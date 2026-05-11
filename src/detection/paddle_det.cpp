@@ -93,6 +93,8 @@ bool PaddleDet::init_buffers() {
     d_jfa_seeds_ = CudaPtr<int2>(max_pixels);
     d_jfa_seeds_alt_ = CudaPtr<int2>(max_pixels);
     d_expand_per_comp_ = CudaPtr<float>(turbo_ocr::kernels::kMaxGpuComponents);
+    h_exp_boxes_ = CudaHostPtr<turbo_ocr::kernels::GpuDetBox>(
+        turbo_ocr::kernels::kMaxGpuComponents);
   }
 
   return true;
@@ -263,19 +265,18 @@ PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
   // for atomic scatter, so no pre-memset needed.
   GpuDetBox *exp_bboxes = d_ccl_bboxes_.get() + kMaxGpuComponents;
   turbo_ocr::kernels::cuda_jfa_extract_bboxes(
-      d_jfa_labels_.get(), cur_output_, d_expand_per_comp_.get(),
-      resize_w, resize_h, exp_bboxes, num_slots, stream);
+      d_jfa_labels_.get(), resize_w, resize_h,
+      exp_bboxes, num_slots, stream);
 
-  // Step 5: Copy expanded bboxes to host
-  CudaHostPtr<GpuDetBox> h_exp_bboxes(num_slots);
-  CUDA_CHECK(cudaMemcpyAsync(h_exp_bboxes.get(), exp_bboxes,
+  // Step 5: Copy expanded bboxes to host via the pre-allocated pinned buffer.
+  CUDA_CHECK(cudaMemcpyAsync(h_exp_boxes_.get(), exp_bboxes,
       num_slots * sizeof(GpuDetBox), cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   // Filter, scale, output. pixel_count==0 means slot was empty or filtered out.
   boxes.reserve(h_num_boxes);
   for (int i = 0; i < num_slots; i++) {
-    const auto &eb = h_exp_bboxes.get()[i];
+    const auto &eb = h_exp_boxes_.get()[i];
     if (eb.pixel_count < 9) continue;
     int bw = eb.xmax - eb.xmin + 1, bh = eb.ymax - eb.ymin + 1;
     if (bw < kMinUnclippedSide || bh < kMinUnclippedSide) continue;

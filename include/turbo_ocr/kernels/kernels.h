@@ -129,12 +129,10 @@ void cuda_compute_expand_per_comp(
     float unclip_ratio, float min_expand, float max_expand,
     float box_thresh, float *d_expand_per_comp, cudaStream_t stream);
 
-// Bbox extraction + score over expanded region. One block per pre-filter
-// compact_id. Empty / filtered-out slots (expand_per_comp[cid]<=0) early-exit
-// without scanning. Output bboxes[cid].pixel_count is 0 for those slots.
+// Image-wide bbox extraction over the expanded label map. One thread per
+// pixel, atomicMin/Max/Add scatter into the per-component bbox slot.
+// Empty / filtered-out slots end up with pixel_count == 0.
 void cuda_jfa_extract_bboxes(const uint32_t *d_expanded_labels,
-                             const float *d_pred_map,
-                             const float *d_expand_per_comp,
                              int w, int h,
                              GpuDetBox *d_bboxes, int num_slots,
                              cudaStream_t stream);
